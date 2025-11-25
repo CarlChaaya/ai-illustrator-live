@@ -1,0 +1,36 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Noto+Kufi+Arabic:wght@400;600&display=swap');
+
+:root {
+  font-family: 'Space Grotesk', 'Noto Kufi Arabic', system-ui, -apple-system, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #e7f0f5;
+  background-color: #050f17;
+  --bg: #050f17;
+  --panel: #0a1a24;
+  --border: #163447;
+  --accent: #1ce5b4;
+  --muted: #9ab3c2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(circle at 20% 20%, rgba(28, 229, 180, 0.08), transparent 24%),
+    radial-gradient(circle at 80% 10%, rgba(255, 178, 102, 0.12), transparent 25%),
+    radial-gradient(circle at 50% 70%, rgba(69, 129, 255, 0.08), transparent 30%),
+    var(--bg);
+  color: #e7f0f5;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+a {
+  color: inherit;
+}
