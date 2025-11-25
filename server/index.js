@@ -3,12 +3,27 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const { OpenAI, toFile } = require('openai');
+const { OpenAIRealtimeWS } = require('openai/realtime/ws');
 const { v4: uuid } = require('uuid');
 const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
+const http = require('http');
+const { WebSocketServer, WebSocket } = require('ws');
 
 const MOCK_OPENAI = process.env.AII_MOCK_OPENAI === 'true';
 const AUDIO_DEBUG = process.env.AII_AUDIO_DEBUG === 'true';
+const DEFAULT_TRANSCRIPTION_MODEL =
+  process.env.AII_TRANSCRIPTION_MODEL || 'gpt-4o-mini-transcribe';
+const ENABLE_TRANSCRIPT_POLISH = process.env.AII_ENABLE_TRANSCRIPT_POLISH !== 'false';
+const TRANSCRIPTION_SAMPLE_RATE = Number(process.env.AII_TRANSCRIPTION_RATE || 24000);
+const TRANSCRIPTION_CONTEXT_MS = Number(process.env.AII_TRANSCRIPTION_CONTEXT_MS || 3 * 60 * 1000);
+const REALTIME_ENABLED = process.env.AII_REALTIME_ENABLED !== 'false';
+const REALTIME_MODEL = process.env.AII_REALTIME_MODEL || 'gpt-4o-mini-realtime-preview';
+const REALTIME_TRANSCRIBE_MODEL =
+  process.env.AII_REALTIME_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIPTION_MODEL;
+const REALTIME_VAD_THRESHOLD = Number(process.env.AII_REALTIME_VAD_THRESHOLD || 0.5);
+const REALTIME_VAD_SILENCE_MS = Number(process.env.AII_REALTIME_VAD_SILENCE_MS || 1200);
+const REALTIME_PREFIX_MS = Number(process.env.AII_REALTIME_PREFIX_MS || 300);
 const app = express();
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -33,6 +48,13 @@ const defaultConfig = {
   stylePreset: 'Flat, high-contrast illustration with simple shapes suitable for a strategy workshop slide.',
 };
 
+const makeRealtimeState = () => ({
+  upstream: null,
+  clients: new Set(),
+  status: 'disconnected',
+  lastMime: 'audio/webm',
+});
+
 let session = {
   active: false,
   apiKey: null,
@@ -44,7 +66,10 @@ let session = {
   generationInProgress: false,
   pendingTrigger: false,
   lastError: null,
+  realtime: makeRealtimeState(),
 };
+
+let realtimeWSS = null;
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -67,12 +92,10 @@ const mockImageB64 =
 const sanitizeTranscript = (text) => {
   const cleaned = (text || '').trim();
   if (!cleaned) return '';
-  const words = cleaned.split(/\s+/).filter(Boolean);
   const alphaCount = cleaned.replace(/[^A-Za-z\u0600-\u06FF]/g, '').length;
   const punctOnly = /^[\p{P}\p{S}]+$/u.test(cleaned);
   if (punctOnly) return '';
-  if (words.length < 2 && cleaned.length < 12) return '';
-  if (alphaCount < 2) return '';
+  if (cleaned.length < 3 && alphaCount < 2) return '';
   return cleaned;
 };
 
@@ -117,6 +140,41 @@ const getRecentTranscriptText = () => {
     .trim();
 };
 
+const getTranscriptionContextText = () => {
+  const cutoff = Date.now() - TRANSCRIPTION_CONTEXT_MS;
+  const text = session.transcripts
+    .filter((entry) => entry.timestamp >= cutoff)
+    .map((entry) => entry.text)
+    .join(' ')
+    .trim();
+  // Keep context short to avoid bloating prompts
+  return text.slice(-800);
+};
+
+const buildTranscriptionPrompt = () => {
+  const vocab = [
+    'NCIM',
+    'National Center for Inspection and Monitoring',
+    'KSA',
+    'Vision 2030',
+    'KPIs',
+    'inspection',
+    'monitoring',
+    'governorates',
+    'digital platform',
+    'field inspectors',
+    'compliance',
+  ].join(', ');
+  const context = getTranscriptionContextText();
+  return [
+    'Bilingual (Arabic + English) transcription for a live NCIM KSA strategy workshop.',
+    `Workshop type: ${session.config.workshopType}. Phase: ${session.config.phase}.`,
+    'Keep short acknowledgements like "yes", "ok", "تمام", "أيوه". Use clear sentence boundaries.',
+    `Prefer these spellings/terms: ${vocab}.`,
+    context ? `Recent context (for continuity): ${context}` : 'No recent context available.',
+  ].join('\n');
+};
+
 const setSessionConfig = (updates = {}) => {
   session.config = { ...session.config, ...updates };
   if (!PHASES.includes(session.config.phase)) {
@@ -131,7 +189,41 @@ const setSessionConfig = (updates = {}) => {
   }
 };
 
+const broadcastRealtime = (payload) => {
+  if (!session.realtime?.clients) return;
+  for (const ws of session.realtime.clients) {
+    if (ws?.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify(payload));
+      } catch (err) {
+        logEvent('error', 'Realtime client send failed', { message: err.message });
+      }
+    }
+  }
+};
+
+const teardownRealtime = (reason = 'session reset') => {
+  if (session.realtime?.upstream) {
+    try {
+      session.realtime.upstream.close({ code: 1000, reason });
+    } catch (err) {
+      logEvent('error', 'Failed to close realtime upstream', { message: err.message });
+    }
+  }
+  if (session.realtime?.clients) {
+    for (const ws of session.realtime.clients) {
+      try {
+        ws.close(1000, reason);
+      } catch (err) {
+        // ignore
+      }
+    }
+  }
+  session.realtime = makeRealtimeState();
+};
+
 const resetSession = () => {
+  teardownRealtime('session reset');
   session = {
     active: false,
     apiKey: null,
@@ -143,6 +235,7 @@ const resetSession = () => {
     generationInProgress: false,
     pendingTrigger: false,
     lastError: null,
+    realtime: makeRealtimeState(),
   };
 };
 
@@ -158,6 +251,220 @@ const getClient = () => {
     throw new Error('Missing OpenAI API key');
   }
   return new OpenAI({ apiKey });
+};
+
+const maybePolishTranscript = async (text) => {
+  const sanitized = sanitizeTranscript(text);
+  if (!sanitized) return '';
+  if (MOCK_OPENAI) return sanitized;
+  if (!ENABLE_TRANSCRIPT_POLISH) return sanitized;
+  try {
+    const client = getClient();
+    const context = getTranscriptionContextText();
+    const response = await client.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.2,
+      max_tokens: 200,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'Clean up a short live transcript segment. Add punctuation and casing, fix obvious tokenisation issues, keep the original language (Arabic or English), and do not invent content.',
+        },
+        {
+          role: 'user',
+          content: `Recent context: ${context || 'n/a'}\nRaw segment:\n${sanitized}\n\nReturn only the cleaned segment.`,
+        },
+      ],
+    });
+    const polished = response.choices?.[0]?.message?.content?.trim();
+    return sanitizeTranscript(polished || sanitized);
+  } catch (error) {
+    logEvent('error', 'Transcript polish failed', { message: error.message });
+    return sanitized;
+  }
+};
+
+const buildRealtimeSessionConfig = () => ({
+  type: 'realtime',
+  modalities: ['text'],
+  input_audio_format: 'pcm16',
+  input_audio_noise_reduction: { type: 'far_field' },
+  input_audio_transcription: {
+    model: REALTIME_TRANSCRIBE_MODEL,
+    language: LANGUAGE_MAP[session.config.languageMode],
+    prompt: buildTranscriptionPrompt(),
+  },
+  turn_detection: {
+    type: 'server_vad',
+    threshold: REALTIME_VAD_THRESHOLD,
+    silence_duration_ms: REALTIME_VAD_SILENCE_MS,
+    prefix_padding_ms: REALTIME_PREFIX_MS,
+    create_response: false,
+  },
+});
+
+const handleRealtimeTranscript = async (rawText, itemId) => {
+  const text = await maybePolishTranscript(rawText);
+  if (!text) return;
+  const entry = { text, timestamp: Date.now(), itemId };
+  session.transcripts.push(entry);
+  trimTranscripts();
+  broadcastRealtime({ type: 'transcript_final', text, itemId, timestamp: entry.timestamp });
+  logEvent('info', 'Realtime transcript received', { length: text.length, itemId });
+};
+
+const handleRealtimeEvent = async (event) => {
+  switch (event.type) {
+    case 'session.created':
+      logEvent('info', 'Realtime session created', { expiresAt: event.session?.expires_at });
+      break;
+    case 'session.updated':
+      logEvent('info', 'Realtime session updated', { inputFormat: event.session?.audio?.input?.format });
+      break;
+    case 'conversation.item.input_audio_transcription.delta':
+      if (event.delta) {
+        broadcastRealtime({
+          type: 'transcript_delta',
+          itemId: event.item_id,
+          delta: event.delta,
+          contentIndex: event.content_index,
+        });
+      }
+      break;
+    case 'conversation.item.input_audio_transcription.segment':
+      if (event.text) {
+        broadcastRealtime({
+          type: 'transcript_segment',
+          itemId: event.item_id,
+          text: event.text,
+          start: event.start,
+          end: event.end,
+        });
+      }
+      break;
+    case 'conversation.item.input_audio_transcription.completed':
+      await handleRealtimeTranscript(event.transcript, event.item_id);
+      break;
+    case 'conversation.item.input_audio_transcription.failed':
+      broadcastRealtime({ type: 'transcript_error', message: event.error?.message || 'Transcription failed' });
+      logEvent('error', 'Realtime transcription failed', {
+        message: event.error?.message,
+        code: event.error?.code,
+      });
+      break;
+    default:
+      break;
+  }
+};
+
+const ensureRealtimeUpstream = async () => {
+  if (!REALTIME_ENABLED || MOCK_OPENAI) return null;
+  if (session.realtime.upstream) return session.realtime.upstream;
+  const client = getClient();
+  session.realtime.status = 'connecting';
+  const rt = await OpenAIRealtimeWS.create(client, { model: REALTIME_MODEL });
+  const awaitOpen = () =>
+    new Promise((resolve) => {
+      if (rt.socket.readyState === rt.socket.OPEN) return resolve();
+      rt.socket.once('open', () => resolve());
+    });
+  await awaitOpen();
+  rt.on('error', (err) => {
+    logEvent('error', 'Realtime upstream error', { message: err.message });
+  });
+  rt.on('event', (evt) => {
+    Promise.resolve(handleRealtimeEvent(evt)).catch((err) => {
+      logEvent('error', 'Realtime event handler failed', { message: err.message });
+    });
+  });
+  session.realtime.upstream = rt;
+  session.realtime.status = 'connected';
+  rt.send({ type: 'session.update', session: buildRealtimeSessionConfig() });
+  logEvent('info', 'Realtime upstream connected', {
+    model: REALTIME_MODEL,
+    transcribeModel: REALTIME_TRANSCRIBE_MODEL,
+  });
+  return rt;
+};
+
+const refreshRealtimeSessionConfig = async () => {
+  if (!session.realtime.upstream) return;
+  try {
+    session.realtime.upstream.send({ type: 'session.update', session: buildRealtimeSessionConfig() });
+  } catch (err) {
+    logEvent('error', 'Failed to refresh realtime session config', { message: err.message });
+  }
+};
+
+const transcodeToPCM = (buffer, mimeType) =>
+  new Promise((resolve, reject) => {
+    if (!ffmpegPath) return reject(new Error('ffmpeg not available'));
+    const normalizedMime = normalizeMime(mimeType);
+    const inputFormatFlags = [];
+    if (normalizedMime.includes('webm')) {
+      inputFormatFlags.push('-f', 'webm');
+    } else if (normalizedMime.includes('ogg')) {
+      inputFormatFlags.push('-f', 'ogg');
+    } else if (normalizedMime.includes('mp3')) {
+      inputFormatFlags.push('-f', 'mp3');
+    }
+    const proc = spawn(ffmpegPath, [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-fflags',
+      '+discardcorrupt',
+      '-err_detect',
+      'ignore_err',
+      ...inputFormatFlags,
+      '-i',
+      'pipe:0',
+      '-ac',
+      '1',
+      '-ar',
+      String(TRANSCRIPTION_SAMPLE_RATE),
+      '-f',
+      's16le',
+      'pipe:1',
+    ]);
+    const chunks = [];
+    let stderr = '';
+    proc.stdout.on('data', (d) => chunks.push(d));
+    proc.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+    proc.on('error', (err) => reject(err));
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve(Buffer.concat(chunks));
+      } else {
+        reject(new Error(`ffmpeg exit ${code}: ${stderr}`));
+      }
+    });
+    proc.stdin.write(buffer);
+    proc.stdin.end();
+  });
+
+const pipeAudioToRealtime = async (buffer, mimeType = 'audio/webm') => {
+  if (!REALTIME_ENABLED || MOCK_OPENAI) return;
+  try {
+    const pcm = await transcodeToPCM(buffer, mimeType);
+    const rt = await ensureRealtimeUpstream();
+    if (!rt) return;
+    rt.send({
+      type: 'input_audio_buffer.append',
+      audio: pcm.toString('base64'),
+    });
+  } catch (err) {
+    session.realtime.status = 'error';
+    logEvent('error', 'Realtime audio append failed', {
+      message: err.message,
+      mime: mimeType,
+      bytes: buffer?.length,
+      head: buffer?.subarray?.(0, 16)?.toString('hex'),
+    });
+  }
 };
 
 const mimeToExt = (mime) => {
@@ -195,7 +502,7 @@ const transcribeAudio = async (buffer, mimeType) => {
         '-ac',
         '1',
         '-ar',
-        '16000',
+        String(TRANSCRIPTION_SAMPLE_RATE),
         '-f',
         'wav',
         'pipe:1',
@@ -218,11 +525,13 @@ const transcribeAudio = async (buffer, mimeType) => {
       proc.stdin.end();
     });
 
-  const callWhisper = async (file) => {
+  const callTranscriptionModel = async (file) => {
     const response = await client.audio.transcriptions.create({
       file,
-      model: 'whisper-1',
+      model: DEFAULT_TRANSCRIPTION_MODEL,
       language: LANGUAGE_MAP[session.config.languageMode],
+      temperature: 0,
+      prompt: buildTranscriptionPrompt(),
     });
     return response.text?.trim() || '';
   };
@@ -242,8 +551,8 @@ const transcribeAudio = async (buffer, mimeType) => {
       const file = await toFile(buffer, `audio.${resolvedExt}`, {
         contentType: effectiveMime,
       });
-      const raw = await callWhisper(file);
-      return sanitizeTranscript(raw);
+      const raw = await callTranscriptionModel(file);
+      return maybePolishTranscript(raw);
     } catch (err) {
       lastError = err;
       logEvent('error', 'Direct transcription failed, retrying with WAV', {
@@ -260,10 +569,11 @@ const transcribeAudio = async (buffer, mimeType) => {
   let targetMime = 'audio/wav';
   try {
     wavBuffer = await convertToWav();
-    logEvent('info', 'Audio converted to wav for whisper', {
+    logEvent('info', 'Audio converted to wav for transcription', {
       inputMime: normalizedMime,
       inputExt: resolvedExt,
       wavBytes: wavBuffer.length,
+      sampleRate: TRANSCRIPTION_SAMPLE_RATE,
     });
   } catch (err) {
     lastError = err;
@@ -280,8 +590,8 @@ const transcribeAudio = async (buffer, mimeType) => {
     const file = await toFile(wavBuffer, `audio.${targetExt}`, {
       contentType: targetMime,
     });
-    const raw = await callWhisper(file);
-    return sanitizeTranscript(raw);
+    const raw = await callTranscriptionModel(file);
+    return maybePolishTranscript(raw);
   } catch (err) {
     lastError = err;
     logEvent('error', 'WAV transcription retry failed', {
@@ -367,7 +677,7 @@ app.post('/api/ping', async (req, res) => {
   }
 });
 
-app.post('/api/session/start', (req, res) => {
+app.post('/api/session/start', async (req, res) => {
   const { apiKey, languageMode, workshopType, summarizationWindowMinutes, imageSize, stylePreset, phase } = req.body || {};
   if (!apiKey && !process.env.OPENAI_API_KEY) {
     return res.status(400).json({ error: 'API key is required to start a session' });
@@ -393,7 +703,17 @@ app.post('/api/session/start', (req, res) => {
     imageSize: session.config.imageSize,
     stylePreset: session.config.stylePreset,
     phase: session.config.phase,
+    transcriptionModel: DEFAULT_TRANSCRIPTION_MODEL,
+    transcriptionRate: TRANSCRIPTION_SAMPLE_RATE,
   });
+  if (REALTIME_ENABLED && !MOCK_OPENAI) {
+    ensureRealtimeUpstream()
+      .then(() => refreshRealtimeSessionConfig())
+      .catch((err) => {
+        session.realtime.status = 'error';
+        logEvent('error', 'Realtime upstream init failed', { message: err.message });
+      });
+  }
   res.json({ ok: true, config: session.config });
 });
 
@@ -422,6 +742,9 @@ app.post('/api/config', (req, res) => {
     autoIntervalMinutes: session.config.autoIntervalMinutes,
     imageSize: session.config.imageSize,
     stylePreset: session.config.stylePreset,
+  });
+  refreshRealtimeSessionConfig().catch((err) => {
+    logEvent('error', 'Realtime config refresh failed', { message: err.message });
   });
   res.json({ ok: true, config: session.config });
 });
@@ -546,6 +869,12 @@ app.get('/api/status', (req, res) => {
     lastError: session.lastError,
     transcripts: session.transcripts.slice(-50),
     images: session.images.filter((img) => !img.deleted),
+    realtime: {
+      enabled: REALTIME_ENABLED && !MOCK_OPENAI,
+      status: session.realtime.status,
+      model: REALTIME_MODEL,
+      transcribeModel: REALTIME_TRANSCRIBE_MODEL,
+    },
   });
 });
 
@@ -599,6 +928,148 @@ app.post('/api/export', (req, res) => {
   res.send(content);
 });
 
+const setupRealtimeGateway = (server) => {
+  realtimeWSS = new WebSocketServer({ server, path: '/ws/audio' });
+  realtimeWSS.on('connection', (ws) => {
+    let transcoder = null;
+    let passthroughPcm = false;
+    const startTranscoder = (mime = 'audio/webm') => {
+      if (transcoder) return transcoder;
+      if (!ffmpegPath) {
+        ws.send(JSON.stringify({ type: 'error', message: 'ffmpeg not available' }));
+        return null;
+      }
+      const normalizedMime = normalizeMime(mime);
+      const inputFormatFlags = [];
+      if (normalizedMime.includes('webm')) inputFormatFlags.push('-f', 'webm');
+      else if (normalizedMime.includes('ogg')) inputFormatFlags.push('-f', 'ogg');
+      else if (normalizedMime.includes('mp3')) inputFormatFlags.push('-f', 'mp3');
+
+      const proc = spawn(ffmpegPath, [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-fflags',
+        '+discardcorrupt',
+        '-err_detect',
+        'ignore_err',
+        ...inputFormatFlags,
+        '-i',
+        'pipe:0',
+        '-ac',
+        '1',
+        '-ar',
+        String(TRANSCRIPTION_SAMPLE_RATE),
+        '-f',
+        's16le',
+        'pipe:1',
+      ]);
+
+      proc.stdout.on('data', async (chunk) => {
+        const rt = await ensureRealtimeUpstream();
+        if (!rt) return;
+        rt.send({
+          type: 'input_audio_buffer.append',
+          audio: Buffer.from(chunk).toString('base64'),
+        });
+      });
+
+      proc.stderr.on('data', (d) => {
+        logEvent('error', 'Realtime ffmpeg stderr', { message: d.toString() });
+      });
+
+      proc.on('close', (code) => {
+        logEvent('info', 'Realtime ffmpeg closed', { code });
+        transcoder = null;
+      });
+
+      transcoder = proc;
+      return transcoder;
+    };
+
+    if (!session.active) {
+      ws.close(1013, 'No active session');
+      return;
+    }
+    if (!REALTIME_ENABLED || MOCK_OPENAI) {
+      ws.close(1013, 'Realtime disabled');
+      return;
+    }
+    session.realtime.clients.add(ws);
+    session.realtime.status = 'client_connected';
+    ws.send(
+      JSON.stringify({
+        type: 'ready',
+        model: REALTIME_MODEL,
+        transcribeModel: REALTIME_TRANSCRIBE_MODEL,
+        sampleRate: TRANSCRIPTION_SAMPLE_RATE,
+      }),
+    );
+
+    ws.on('message', async (data, isBinary) => {
+      if (!session.active) {
+        ws.send(JSON.stringify({ type: 'error', message: 'No active session' }));
+        return;
+      }
+      if (!REALTIME_ENABLED) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Realtime disabled' }));
+        return;
+      }
+      if (!isBinary) {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === 'start') {
+            session.realtime.lastMime = msg.mime || session.realtime.lastMime;
+            passthroughPcm = msg.format === 'pcm16';
+            ws.send(JSON.stringify({ type: 'ack', message: 'start' }));
+            ensureRealtimeUpstream().catch((err) =>
+              logEvent('error', 'Realtime upstream init failed (ws)', { message: err.message }),
+            );
+          } else if (msg.type === 'commit') {
+            const rt = await ensureRealtimeUpstream();
+            rt?.send({ type: 'input_audio_buffer.commit' });
+          }
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Invalid control message' }));
+        }
+        return;
+      }
+
+      const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      if (!chunk || chunk.length === 0) return;
+      if (passthroughPcm) {
+        const rt = await ensureRealtimeUpstream();
+        if (!rt) return;
+        rt.send({
+          type: 'input_audio_buffer.append',
+          audio: chunk.toString('base64'),
+        });
+        return;
+      }
+      const proc = startTranscoder(session.realtime.lastMime);
+      if (!proc) return;
+      proc.stdin.write(chunk);
+    });
+
+    const cleanup = () => {
+      session.realtime.clients.delete(ws);
+      if (transcoder) {
+        try {
+          transcoder.stdin.end();
+          transcoder.kill('SIGTERM');
+        } catch (e) {
+          // ignore
+        }
+        transcoder = null;
+      }
+    };
+    ws.on('close', cleanup);
+    ws.on('error', cleanup);
+  });
+  logEvent('info', 'Realtime websocket gateway ready', { path: '/ws/audio' });
+  return realtimeWSS;
+};
+
 process.on('unhandledRejection', (reason) => {
   logEvent('error', 'Unhandled promise rejection', { reason });
 });
@@ -608,7 +1079,9 @@ process.on('uncaughtException', (error) => {
 });
 
 if (require.main === module) {
-  app.listen(PORT, () => {
+  const server = http.createServer(app);
+  setupRealtimeGateway(server);
+  server.listen(PORT, () => {
     console.log(`AI Illustrator backend listening on http://localhost:${PORT}`);
   });
 }

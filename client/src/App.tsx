@@ -33,6 +33,10 @@ const STYLE_PRESETS = [
   'Minimal line art with soft gradients and clean iconography.',
   'Semi-realistic workshop sketch with warm lighting and simplified faces.',
 ];
+const CHUNK_DURATION_MS = 2000; // slightly longer slices for stable container boundaries
+const MIN_SPEECH_FRAMES = 6; // require multiple frames above threshold before dropping a chunk
+const SILENCE_RMS_THRESHOLD = 0.0015; // more sensitive than the previous 0.003 default
+const WS_BASE = (API_BASE || '').replace(/^http/, 'ws');
 
 const formatClock = (iso?: string) => {
   if (!iso) return '';
@@ -81,15 +85,89 @@ function App() {
   const [skipSilence, setSkipSilence] = useState(false);
   const [testingKey, setTestingKey] = useState(false);
   const [connectionNote, setConnectionNote] = useState('');
+  const [realtimeStatus, setRealtimeStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
+  const [partialTranscript, setPartialTranscript] = useState('');
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
   const rafRef = useRef<number | null>(null);
-  const lastRmsRef = useRef(0);
   const chunkHasSpeechRef = useRef(false);
+  const speechFrameCountRef = useRef(0);
+  const wsRef = useRef<WebSocket | null>(null);
+  const partialMapRef = useRef<Map<string, string>>(new Map());
 
-  const SILENCE_RMS_THRESHOLD = 0.003;
+  const closeRealtimeSocket = () => {
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch (e) {
+        // ignore
+      }
+    }
+    wsRef.current = null;
+    partialMapRef.current.clear();
+    setPartialTranscript('');
+    setRealtimeStatus('idle');
+  };
+
+  const handleRealtimeMessage = async (event: MessageEvent) => {
+    try {
+      const raw =
+        typeof event.data === 'string'
+          ? event.data
+          : event.data instanceof Blob
+          ? await event.data.text()
+          : new TextDecoder().decode(event.data as ArrayBuffer);
+      const msg = JSON.parse(raw);
+      if (msg.type === 'ready' || msg.type === 'ack') {
+        setRealtimeStatus('connected');
+        setStatusMessage('Realtime ready');
+      } else if (msg.type === 'transcript_delta') {
+        const prev = partialMapRef.current.get(msg.itemId) || '';
+        const next = (prev + (msg.delta || '')).slice(-400);
+        partialMapRef.current.set(msg.itemId, next);
+        setPartialTranscript(next);
+      } else if (msg.type === 'transcript_final') {
+        partialMapRef.current.delete(msg.itemId);
+        setPartialTranscript('');
+        if (msg.text) {
+          addTranscript(msg.text, msg.timestamp || Date.now());
+        }
+      } else if (msg.type === 'transcript_error' || msg.type === 'error') {
+        setError(msg.message || 'Realtime error');
+        setRealtimeStatus('error');
+      }
+    } catch (e) {
+      // ignore malformed messages
+    }
+  };
+
+  const openRealtimeSocket = (preferredMime: string) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      return wsRef.current;
+    }
+    const ws = new WebSocket(`${WS_BASE}/ws/audio`);
+    wsRef.current = ws;
+    setRealtimeStatus('connecting');
+    ws.addEventListener('message', (event) => {
+      handleRealtimeMessage(event);
+    });
+    ws.addEventListener('open', () => {
+      setRealtimeStatus('connected');
+      ws.send(JSON.stringify({ type: 'start', mime: preferredMime, chunkMs: CHUNK_DURATION_MS }));
+    });
+    ws.addEventListener('error', () => {
+      setRealtimeStatus('error');
+      setStatusMessage('Realtime error');
+    });
+    ws.addEventListener('close', () => {
+      setRealtimeStatus('idle');
+      partialMapRef.current.clear();
+      setPartialTranscript('');
+    });
+    return ws;
+  };
 
   const pickMimeType = () => {
     const candidates = ['audio/ogg;codecs=opus', 'audio/webm;codecs=opus', 'audio/webm'];
@@ -132,6 +210,17 @@ function App() {
           setImageSize(data.config.imageSize);
           setStylePreset(data.config.stylePreset);
         }
+        if (data.realtime?.status) {
+          const mapped =
+            data.realtime.status === 'connected' || data.realtime.status === 'client_connected'
+              ? 'connected'
+              : data.realtime.status === 'connecting'
+              ? 'connecting'
+              : data.realtime.status === 'error'
+              ? 'error'
+              : 'idle';
+          setRealtimeStatus(mapped);
+        }
       } catch (e) {
         // ignore periodic errors
       }
@@ -166,17 +255,16 @@ function App() {
     return () => clearTimeout(id);
   }, [sessionActive, phase, autoInterval, imageSize, stylePreset]);
 
-  const addTranscript = (text: string) => {
-    setTranscripts((prev) => [...prev, { text, timestamp: Date.now() }].slice(-400));
+  const addTranscript = (text: string, timestamp = Date.now()) => {
+    setTranscripts((prev) => [...prev, { text, timestamp }].slice(-400));
   };
 
   const startAudio = async () => {
-    if (mediaRecorderRef.current) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       audioStreamRef.current = stream;
       const preferredMime = pickMimeType();
-      const audioCtx = new AudioContext();
+      const audioCtx = new AudioContext({ sampleRate: 24000 });
       await audioCtx.resume();
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
@@ -189,56 +277,56 @@ function App() {
         analyser.getByteTimeDomainData(dataArray);
         const normalized = dataArray.map((v) => (v - 128) / 128);
         const rms = Math.sqrt(normalized.reduce((acc, val) => acc + val * val, 0) / normalized.length);
-        lastRmsRef.current = rms;
         if (rms >= SILENCE_RMS_THRESHOLD) {
           chunkHasSpeechRef.current = true;
+          speechFrameCountRef.current += 1;
         }
         setAudioLevel(Math.min(1, rms * 4));
         rafRef.current = requestAnimationFrame(tick);
       };
       tick();
 
-      const uploadBlob = async (blob: Blob) => {
-        if (!blob || blob.size < 2048) return;
-        if (skipSilence && !chunkHasSpeechRef.current) {
-          setStatusMessage('Silence detected (not sending)');
+      openRealtimeSocket(preferredMime);
+      const resetChunkMeters = () => {
+        chunkHasSpeechRef.current = false;
+        speechFrameCountRef.current = 0;
+      };
+
+      const sendPcm = (pcm: ArrayBuffer) => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+        wsRef.current.send(pcm);
+        setStatusMessage('Streaming audio');
+      };
+
+      const processor = audioCtx.createScriptProcessor(2048, 1, 1);
+      processorRef.current = processor;
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+      processor.onaudioprocess = (event) => {
+        if (transcriptionPaused) return;
+        const input = event.inputBuffer.getChannelData(0);
+        const rms =
+          Math.sqrt(input.reduce((acc, sample) => acc + sample * sample, 0) / input.length) || 0;
+        if (rms >= SILENCE_RMS_THRESHOLD) {
+          chunkHasSpeechRef.current = true;
+          speechFrameCountRef.current += 1;
+        }
+        if (
+          skipSilence &&
+          (!chunkHasSpeechRef.current || speechFrameCountRef.current < MIN_SPEECH_FRAMES)
+        ) {
           return;
         }
-        const form = new FormData();
-        const inferredExt = blob.type.includes('ogg') ? 'ogg' : blob.type.includes('wav') ? 'wav' : 'webm';
-        form.append('audio', blob, `chunk.${inferredExt}`);
-        try {
-          const res = await fetch(`${API_BASE}/api/audio`, {
-            method: 'POST',
-            body: form,
-          });
-          const data = await res.json();
-          if (res.ok && data.text) {
-            addTranscript(data.text);
-            setStatusMessage('Listening');
-          } else if (!res.ok) {
-            setError(data.error || 'Transcription failed');
-          }
-        } catch (err: any) {
-          setError(err?.message || 'Audio upload failed');
+        const int16 = new Int16Array(input.length);
+        for (let i = 0; i < input.length; i += 1) {
+          const s = Math.max(-1, Math.min(1, input[i]));
+          int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
         }
+        sendPcm(int16.buffer);
+        resetChunkMeters();
       };
 
-      const recorder = new MediaRecorder(stream, {
-        ...(preferredMime ? { mimeType: preferredMime } : {}),
-        audioBitsPerSecond: 128000,
-      });
-      mediaRecorderRef.current = recorder;
-
-      recorder.ondataavailable = async (event) => {
-        if (event.data && event.data.size > 2048 && !transcriptionPaused) {
-          await uploadBlob(event.data);
-          chunkHasSpeechRef.current = false;
-        }
-      };
-
-      recorder.start(4000); // timeslice emits every 4s with headers
-      setStatusMessage(`Listening${preferredMime ? ` (${preferredMime})` : ''}`);
+      setStatusMessage(`Listening (realtime PCM)${preferredMime ? ` (${preferredMime})` : ''}`);
     } catch (err: any) {
       setError('Microphone permission denied or unavailable');
       setStatusMessage('Microphone unavailable');
@@ -246,15 +334,14 @@ function App() {
   };
 
   const stopAudio = () => {
-    if (mediaRecorderRef.current?.state === 'recording') {
-      mediaRecorderRef.current.stop();
-    }
-    mediaRecorderRef.current = null;
     analyserRef.current?.disconnect();
+    processorRef.current?.disconnect();
+    processorRef.current = null;
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     audioStreamRef.current?.getTracks().forEach((t) => t.stop());
     audioStreamRef.current = null;
     setAudioLevel(0);
+    closeRealtimeSocket();
   };
 
   const toggleTranscription = async () => {
@@ -357,6 +444,8 @@ function App() {
     setLastSummary(null);
     setAutoEnabled(false);
     setStatusMessage('Session ended');
+    setPartialTranscript('');
+    setRealtimeStatus('idle');
   };
 
   const triggerGenerate = async (isAuto = false) => {
@@ -590,6 +679,26 @@ function App() {
                 <span className={classNames('pill', generationInProgress ? 'warn' : 'neutral')}>
                   {generationInProgress ? 'Generating' : 'Idle'}
                 </span>
+                <span
+                  className={classNames(
+                    'pill',
+                    realtimeStatus === 'connected'
+                      ? 'good'
+                      : realtimeStatus === 'connecting'
+                      ? 'warn'
+                      : realtimeStatus === 'error'
+                      ? 'bad'
+                      : 'neutral',
+                  )}
+                >
+                  {realtimeStatus === 'connected'
+                    ? 'Realtime on'
+                    : realtimeStatus === 'connecting'
+                    ? 'Realtime...'
+                    : realtimeStatus === 'error'
+                    ? 'Realtime error'
+                    : 'Realtime off'}
+                </span>
                 {transcriptionPaused && <span className="pill warn">Paused</span>}
                 {error && <span className="pill bad">Error</span>}
               </div>
@@ -654,6 +763,12 @@ function App() {
                     {t.text}
                   </p>
                 ))}
+                {partialTranscript && (
+                  <p className="muted">
+                    <span className="muted">Live — </span>
+                    {partialTranscript}
+                  </p>
+                )}
               </div>
             </div>
 

@@ -23,9 +23,10 @@ cd client && npm run dev   # opens on http://localhost:5173
 
 ## How it works
 
-- Browser captures microphone audio (no disk writes) and sends small chunks to the backend.
-- Backend transcribes with Whisper, keeps a rolling transcript (defaults: 10 minutes), summarises with GPT-4o-mini, builds an English illustration prompt, and generates images with `gpt-image-1`.
-- One active session at a time; in-memory only until you export prompts. API key lives only in memory unless you opt to store it in browser localStorage.
+- Browser captures microphone audio (no disk writes) and streams ~1.2s WebM/Opus slices over WebSocket to the backend with a softer, frame-count-based silence gate (skip is optional).
+- Backend decodes each slice to mono 24 kHz PCM and forwards it to the OpenAI Realtime API (`gpt-4o-mini-realtime-preview` + `gpt-4o-mini-transcribe` for transcription with server VAD). Transcripts arrive incrementally and are lightly polished, then kept in a rolling window (defaults: 10 minutes).
+- Summarisation + prompt building use GPT-4o-mini; images are generated with `gpt-image-1`.
+- One active session at a time; in-memory only until you export prompts. API key lives only in memory unless you opt to store it in browser localStorage. The legacy `/api/audio` chunk endpoint remains available as a fallback.
 
 ## Key endpoints (backend)
 
@@ -36,15 +37,17 @@ cd client && npm run dev   # opens on http://localhost:5173
 - `POST /api/config` – update phase/interval/size/style.
 - `PATCH/DELETE /api/images/:id` – pin/unpin or soft delete.
 - `POST /api/export` – download markdown with prompts and metadata.
+- `WS /ws/audio` – realtime audio bridge (streams 24 kHz PCM to OpenAI Realtime); the browser sends 1.2s WebM/Opus slices.
 
 ## Configuration notes
 
 - Default image size `1024x1024`; widescreen `1792x1024` available.
-- Audio is recorded in the browser (WebM/Opus where supported) and sent directly to Whisper with a WAV fallback for unknown containers—no unnecessary transcoding in the common path.
+- Audio is recorded in the browser (WebM/Opus where supported) and streamed over WebSocket. Server decodes to 24 kHz PCM and pushes to the Realtime API with server-side VAD and transcription.
 - Auto cadence options: 3/5/10 minutes. Manual “Generate now” always available.
 - Language modes: Auto detect, Arabic primary, English primary.
 - Style presets editable in Settings; prompts always emitted in English.
 - If a trigger fires while generation is running, the next run is queued and executed immediately after.
+- Transcription defaults: model `gpt-4o-mini-transcribe` (Realtime uses `gpt-4o-mini-realtime-preview` + the same ASR model), 24 kHz mono. Override with `AII_TRANSCRIPTION_MODEL`, disable polishing with `AII_ENABLE_TRANSCRIPT_POLISH=false`, change sample rate via `AII_TRANSCRIPTION_RATE`, or set realtime knobs (`AII_REALTIME_MODEL`, `AII_REALTIME_TRANSCRIBE_MODEL`, `AII_REALTIME_VAD_THRESHOLD`, `AII_REALTIME_VAD_SILENCE_MS`). Set `AII_AUDIO_DEBUG=true` to log chunk signatures.
 
 ## Security and privacy
 
